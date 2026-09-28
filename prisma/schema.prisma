@@ -1,0 +1,769 @@
+// Production Order Tracking System — Phase 1
+// See: Project Flow Phase 1.md and the approved implementation plan.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// An order's overall lifecycle position. Everything short of DELIVERED is still
+/// "in progress" regardless of which station it's currently at or in transit to —
+/// see Order.currentStationId / isCheckedIn for the finer-grained position.
+enum OrderStatus {
+  IN_PROGRESS
+  DELIVERED
+}
+
+enum QcOutcome {
+  APPROVED
+  REWORK
+}
+
+enum DeliveryOutcomeType {
+  DELIVERED
+  RETURNED
+}
+
+enum ReturnReason {
+  DEFECT
+  DISSATISFACTION
+  MISSING_OR_LACKING
+}
+
+enum OrderEventType {
+  INTAKE_CREATED
+  STATION_RECEIVED
+  STATION_OUTGOING
+  QC_DECISION
+  REWORK_ROUTED
+  DELIVERY_CONFIRMED
+  RETURNED_TO_SENDER
+  QR_REGENERATED
+  ARCHIVED
+  UNARCHIVED
+  CONCERN_RAISED
+  CONCERN_RESOLVED
+  STATION_REJECTED
+  STATION_OVERRIDDEN
+  ITEM_ADDED
+  ITEM_UPDATED
+  ITEM_REMOVED
+  RETURN_DECISION
+  REPLACEMENT_ISSUED
+  DOWN_PAYMENT_UPDATED
+}
+
+enum ReturnOutcome {
+  SEND_TO_QC
+  FOR_REPLACEMENT
+}
+
+enum ReplacementStatus {
+  NONE
+  FLAGGED
+  ISSUED
+}
+
+enum PromoDiscountType {
+  PERCENT
+  FIXED
+}
+
+enum OrderConcernType {
+  CONCERN
+  CLARIFICATION
+}
+
+enum ActivityLogAction {
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  LOGOUT
+  REFRESH_TOKEN_REUSE_DETECTED
+  CREATED
+  UPDATED
+}
+
+enum ActivityLogEntityType {
+  USER
+  ROLE
+  STATION
+  CATEGORY
+  PRODUCT
+  QC_REJECTION_REASON
+  PROMO_CODE
+}
+
+/// Management-only audit trail: auth events (login/logout/refresh-theft) plus create/update
+/// on the 5 admin-config resources. Order-lifecycle actions (scan/QC/delivery) are NOT
+/// duplicated here — those stay exclusively in OrderEvent. No FK to User (actorUserId is a
+/// plain, possibly-null string, same reasoning as OrderEvent.actorUserId) — actor details are
+/// resolved back out via a second batch query, same pattern as timeline.service.ts.
+model ActivityLog {
+  id          String                 @id @default(cuid())
+  action      ActivityLogAction
+  entityType  ActivityLogEntityType?
+  entityId    String?
+  /// Null only for LOGIN_FAILURE against an email that doesn't resolve to any user.
+  actorUserId String?
+  /// Populated for all 4 auth actions (known or not); left null for admin/config actions
+  /// since actorUserId is always resolvable there.
+  actorEmail  String?
+  ip          String?
+  userAgent   String?
+  message     String?
+  metadata    Json?
+  createdAt   DateTime               @default(now())
+
+  @@index([createdAt])
+  @@index([actorUserId])
+  @@index([entityType, entityId])
+  @@map("activity_logs")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users       User[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+/// Fixed, code-defined catalog — seeded once, read-only via the API. Each slug maps to
+/// a hardcoded fastify.authorize(slug) call at a specific route; no POST/PATCH exists
+/// for this model on purpose.
+model Permission {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  id           String     @id @default(cuid())
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id])
+  permissionId String
+  permission   Permission @relation(fields: [permissionId], references: [id])
+  createdAt    DateTime   @default(now())
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model Station {
+  id             String   @id @default(cuid())
+  name           String   @unique
+  slug           String   @unique
+  logoUrl        String?
+  description    String?
+  colorHex       String?
+  sortOrder      Int      @default(0)
+  /// Exits via an approve/rework decision (POST /orders/:id/qc-decision) instead of a
+  /// plain outgoing scan, and can route rework back to any earlier active station.
+  isQcCheckpoint Boolean  @default(false)
+  /// Fixed, code-defined stage (QC, Courier/Pick-up) seeded once — not Management-editable
+  /// (name/slug/sortOrder/isQcCheckpoint/isActive are all locked) and always sorted after
+  /// every non-system station regardless of numeric sortOrder. Station workers can only be
+  /// assigned to non-system stations; see User.assignedStationId.
+  isSystem       Boolean  @default(false)
+  /// The fixed Return section — a system station that sits OFF the linear production sequence
+  /// (workflow.ts activeSorted skips it), entered only when delivery records RETURNED and exited
+  /// only via a return decision (send to QC, or flag items for replacement).
+  isReturnStation Boolean @default(false)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  ordersHere       Order[]           @relation("OrderCurrentStation")
+  stationVisits    StationVisit[]
+  reworkRoutes     ReworkRoute[]     @relation("ReworkRouteTarget")
+  reworkRoutesFrom ReworkRoute[]     @relation("ReworkRouteFrom")
+  deliveryOutcomes DeliveryOutcome[]
+  events           OrderEvent[]
+  assignedWorkers  User[]            @relation("UserAssignedStation")
+  concerns         OrderConcern[]
+
+  @@map("stations")
+}
+
+model ProductCategory {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  slug      String   @unique
+  sortOrder Int      @default(0)
+  /// A URL (either uploaded via POST /categories/:id/logo/upload — served locally under
+  /// /uploads/categories — or pasted directly via PATCH, same "no upload required" option
+  /// Station.logoUrl already offers).
+  logoUrl   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products Product[]
+
+  @@map("product_categories")
+}
+
+model Product {
+  id           String          @id @default(cuid())
+  categoryId   String
+  category     ProductCategory @relation(fields: [categoryId], references: [id])
+  name         String
+  description  String?
+  regularPrice Float
+  /// The price charged when an order item for this product is marked customized instead of
+  /// regular (see OrderItem.isCustomized) — a distinct base price, not a discount off
+  /// regularPrice, since a custom build can legitimately cost more or less.
+  customizedPrice Float
+  rating       Float?
+  isActive     Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  images       ProductImage[]
+  colorLinings ProductColorLining[]
+  orderItems   OrderItem[]
+  priceHistory ProductPriceHistory[]
+
+  @@index([categoryId])
+  @@map("products")
+}
+
+/// Append-only log of a product's regularPrice/customizedPrice at each point it changed —
+/// one row per change, newest last. A row's values are "current as of createdAt", so
+/// the previous price is just the row before it, same pattern as OrderEvent.
+model ProductPriceHistory {
+  id              String   @id @default(cuid())
+  productId       String
+  product         Product  @relation(fields: [productId], references: [id])
+  regularPrice    Float
+  customizedPrice Float
+  changedByUserId String
+  createdAt       DateTime @default(now())
+
+  @@index([productId, createdAt])
+  @@map("product_price_history")
+}
+
+/// Management-configured order-level discount code, entered at intake. Never deleted —
+/// set isActive false to retire it, since past orders reference it.
+model PromoCode {
+  id           String            @id @default(cuid())
+  /// Stored uppercase; lookups are case-insensitive by normalizing input the same way.
+  code         String            @unique
+  description  String?
+  discountType PromoDiscountType
+  /// Percent (0-100] for PERCENT, peso amount for FIXED.
+  value        Float
+  startsAt     DateTime?
+  expiresAt    DateTime?
+  maxUses      Int?
+  usesCount    Int               @default(0)
+  isActive     Boolean           @default(true)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  orders Order[]
+
+  @@map("promo_codes")
+}
+
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  url       String
+  sortOrder Int      @default(0)
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+/// Per-product color lining options (e.g. "Black Lining", "Red Lining").
+model ProductColorLining {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  label     String
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  orderItems OrderItem[]
+
+  @@unique([productId, label])
+  @@index([productId])
+  @@map("product_color_linings")
+}
+
+model User {
+  id                String   @id @default(cuid())
+  email             String   @unique
+  passwordHash      String
+  name              String
+  roleId            String
+  role              Role     @relation(fields: [roleId], references: [id])
+  /// The single production station this user may scan at (non-system stations only). Null
+  /// means unrestricted — most roles (Supervisor, Management) have no assignment and can
+  /// scan anywhere; a Station Worker is expected to have exactly one.
+  assignedStationId String?
+  assignedStation   Station? @relation("UserAssignedStation", fields: [assignedStationId], references: [id])
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  createdOrders  Order[]        @relation("OrderCreatedBy")
+  assignedOrders Order[]        @relation("OrderAssignedWorker")
+  refreshTokens  RefreshToken[]
+
+  @@index([roleId])
+  @@index([assignedStationId])
+  @@map("users")
+}
+
+/// Opaque, rotate-on-use refresh tokens backing the short-lived (15m) access JWT. Only a
+/// sha256 hash of the raw token is ever stored — the raw value is returned to the client
+/// once, at issuance/rotation, and never persisted. familyId groups every token descended
+/// from one login: reusing an already-rotated (or revoked) token revokes the whole family,
+/// since that reuse is a signal the token was stolen — see auth.service.ts.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  familyId  String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+/// Atomic sequence generator for human-readable order numbers (e.g. RC-2026-000123).
+model Counter {
+  key   String @id
+  value Int    @default(0)
+
+  @@map("counters")
+}
+
+model Order {
+  id                   String      @id @default(cuid())
+  orderNumber          String      @unique
+  qrToken              String      @unique @default(cuid())
+  customerId           String
+  customer             Customer    @relation(fields: [customerId], references: [id])
+  orderDate            DateTime    @default(now())
+  proposedDurationDays Int
+  deadline             DateTime
+  priority             Int?
+  status               OrderStatus @default(IN_PROGRESS)
+  currentStationId     String?
+  currentStation       Station?    @relation("OrderCurrentStation", fields: [currentStationId], references: [id])
+  isCheckedIn          Boolean     @default(false)
+  /// Archiving fully freezes an order (blocks edit/scan/QC/delivery, see the archive/unarchive
+  /// endpoints) and hides it from GET /orders by default — used to remove a bad/test intake, or
+  /// to tidy old finished orders out of the active dashboard, without losing its audit history.
+  isArchived           Boolean     @default(false)
+  archivedAt           DateTime?
+  /// Pins the order to one specific worker, distinct from currentStation.assignedWorkers
+  /// (everyone assigned to the station generally). Set via the admin station-override action
+  /// (POST /orders/:id/override-station), or automatically on a QC rework decision (POST
+  /// /orders/:id/qc-decision) to whoever last received the order at the rework target station —
+  /// see qc.service.ts. Must reference a user whose assignedStationId matches currentStationId
+  /// at the time it was set. Reset to null on every subsequent override/rework routing unless
+  /// re-supplied or re-resolved, since a pin to the old station's worker wouldn't make sense
+  /// once the order has moved.
+  assignedWorkerUserId String?
+  assignedWorker       User?       @relation("OrderAssignedWorker", fields: [assignedWorkerUserId], references: [id])
+  createdByUserId      String
+  createdBy            User        @relation("OrderCreatedBy", fields: [createdByUserId], references: [id])
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+  /// Monotonic counter for OrderItem.itemNo — only ever incremented, never derived from
+  /// COUNT/MAX of currently-existing items, so a deleted item's number can never be handed
+  /// to a later item. Internal only, never exposed via the API.
+  itemCounter          Int         @default(0)
+  /// Promo applied at intake. promoCodeId links back for usage tracking; promoCode/promoType/
+  /// promoValue are a snapshot of the code as it was then, so later edits to the PromoCode
+  /// never change this order. The peso amount is computed on read (see toOrderDto) from the
+  /// current items, so it stays consistent if items are added/edited afterwards.
+  promoCodeId          String?
+  promoCodeRef         PromoCode?  @relation(fields: [promoCodeId], references: [id])
+  promoCode            String?
+  promoType            PromoDiscountType?
+  promoValue           Float?
+  /// Amount the customer has already paid toward finalPrice, set at intake or edited later via
+  /// PATCH /orders/:id. Never negative, never more than finalPrice — enforced in orders.service.ts,
+  /// not at the DB level, since finalPrice itself is computed on read from the current items/promo
+  /// rather than stored. If a later item edit/removal drops finalPrice below this value, it's
+  /// clamped down automatically (see clampDownPaymentIfNeeded) rather than left stranded above it.
+  downPayment          Float       @default(0)
+
+  items            OrderItem[]
+  stationVisits    StationVisit[]
+  qcReviews        QcReview[]
+  returnReviews    ReturnReview[]
+  reworkRoutes     ReworkRoute[]
+  deliveryOutcomes DeliveryOutcome[]
+  events           OrderEvent[]
+  concerns         OrderConcern[]
+
+  @@index([status])
+  @@index([currentStationId])
+  @@index([priority])
+  @@index([deadline])
+  @@index([isArchived])
+  @@index([assignedWorkerUserId])
+  @@index([customerId])
+  @@map("orders")
+}
+
+/// One line item within an order — a product/color-lining/price combination, with its
+/// own quantity and per-unit discount. The order itself still moves through production
+/// as ONE shared physical unit (one QR, one StationVisit/QC/Delivery timeline) — items
+/// are not tracked independently. They exist so a QC/rework decision can name exactly
+/// which item(s) in a multi-item order had a defect (see ReworkRouteItem).
+model OrderItem {
+  id                  String              @id @default(cuid())
+  orderId             String
+  order               Order               @relation(fields: [orderId], references: [id])
+  productId           String
+  product             Product             @relation(fields: [productId], references: [id])
+  colorLiningId       String?
+  colorLining         ProductColorLining? @relation(fields: [colorLiningId], references: [id])
+  /// Position within the order (1, 2, 3…), assigned once at creation and never reused or
+  /// renumbered — even after another item on the order is removed — so "item 2" always
+  /// means the same physical item, the same way StationVisit.sequenceNo never renumbers.
+  /// Combined with the order's orderNumber to form the human-readable itemCode on read.
+  itemNo              Int
+  quantity            Int                 @default(1)
+  /// Whether this line is the regular or customized version of the product — drives which of
+  /// Product.regularPrice/customizedPrice unitPrice is auto-filled from at intake/add-item time.
+  /// unitPrice can still be overridden independently of this flag (see unitPrice below).
+  isCustomized        Boolean             @default(false)
+  /// Snapshotted from the product when this item was added — the price actually charged.
+  /// Auto-derived from Product.regularPrice/customizedPrice based on isCustomized,
+  /// but always client-overridable at intake/add-item/update time. Never recomputed from the
+  /// live catalog after the fact, so later product price changes never retroactively alter
+  /// past orders.
+  unitPrice           Float
+  /// The product's undiscounted price for this item's regular/customized selection at that
+  /// same moment, for reference — lets you derive the discount actually given
+  /// (regularPriceAtOrder - unitPrice) historically.
+  regularPriceAtOrder Float
+  /// A per-unit discount on top of unitPrice (negotiated price, loyalty discount, etc.) —
+  /// distinct from a product-level sale, which is already baked into unitPrice. Line total
+  /// = (unitPrice - discountAmount) * quantity.
+  discountAmount      Float               @default(0)
+  discountReason      String?
+  /// Free-text note on this specific line item (e.g. sizing, special instructions) —
+  /// distinct from discountReason, unrelated to pricing.
+  note                String?
+  /// NONE by default. FLAGGED when the Return station marks this item for replacement; ISSUED
+  /// once a Supervisor+ issues the replacement (POST /orders/:id/issue-replacement), which
+  /// loops the order back to the first station. Stays ISSUED as history afterwards.
+  replacementStatus   ReplacementStatus   @default(NONE)
+  replacementFlaggedAt DateTime?
+  replacementIssuedAt  DateTime?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  reworkRouteItems ReworkRouteItem[]
+  stationProgress  OrderItemStationProgress[]
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+/// Prep for an eventual client-facing portal (still out of scope for Phase 1 — see plan.md
+/// §6) where a customer will sign in by email and complete their profile. For now, just the
+/// identity layer: a customer must be created via POST /customers before being selectable at
+/// intake — no free-text customer entry anywhere, so order-count/history per customer is
+/// always accurate. Full CRUD + archive, same pattern as Order (isArchived/archivedAt freezes
+/// edits and hides it from the default list; an archived customer can't be selected for a new
+/// or edited order either).
+model Customer {
+  id         String    @id @default(cuid())
+  name       String
+  phone      String?
+  email      String?   @unique
+  isArchived Boolean   @default(false)
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  orders Order[]
+
+  @@index([phone])
+  @@index([isArchived])
+  @@map("customers")
+}
+
+model StationVisit {
+  id               String    @id @default(cuid())
+  orderId          String
+  order            Order     @relation(fields: [orderId], references: [id])
+  stationId        String
+  station          Station   @relation(fields: [stationId], references: [id])
+  sequenceNo       Int
+  receivedAt       DateTime?
+  receivedByUserId String?
+  outgoingAt       DateTime?
+  outgoingByUserId String?
+  isReworkVisit    Boolean   @default(false)
+  /// Set when this visit was created because it's the resulting revisit of a ReworkRoute
+  /// (i.e. receiveAtStation found a pending route targeting this station) — see
+  /// ReworkRoute.resultingStationVisitId, its inverse. Plain string, no FK relation, same
+  /// convention as OrderEvent.actorUserId. Null for an order's first-ever visit to a station,
+  /// or for a revisit not tied to any route (shouldn't normally happen).
+  reworkRouteId    String?
+  notes            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  itemProgress OrderItemStationProgress[]
+
+  @@unique([orderId, stationId, sequenceNo])
+  @@index([orderId])
+  @@index([stationId])
+  @@map("station_visits")
+}
+
+/// Per-item "finished at this station" checklist, informational only — does not gate the
+/// outgoing scan (see canLogOutgoing in workflow.ts, unchanged). Scoped to a specific
+/// StationVisit rather than just (orderItem, station), so a rework revisit automatically
+/// starts every item back at "not finished" — a new StationVisit row means no progress rows
+/// reference it yet, no explicit reset needed. Absence of a row = not finished (the default);
+/// a row only ever exists once something has been toggled at least once.
+model OrderItemStationProgress {
+  id               String       @id @default(cuid())
+  orderItemId      String
+  orderItem        OrderItem    @relation(fields: [orderItemId], references: [id])
+  stationVisitId   String
+  stationVisit     StationVisit @relation(fields: [stationVisitId], references: [id])
+  isFinished       Boolean      @default(false)
+  finishedAt       DateTime?
+  finishedByUserId String?
+  updatedAt        DateTime     @updatedAt
+
+  @@unique([orderItemId, stationVisitId])
+  @@index([stationVisitId])
+  @@map("order_item_station_progress")
+}
+
+/// Return station's decision on an order that came back from delivery — mirrors QcReview.
+/// SEND_TO_QC re-enters the normal QC flow; FOR_REPLACEMENT flags items (see
+/// OrderItem.replacementStatus) until a Supervisor+ issues the replacement.
+model ReturnReview {
+  id               String        @id @default(cuid())
+  orderId          String
+  order            Order         @relation(fields: [orderId], references: [id])
+  stationVisitId   String
+  outcome          ReturnOutcome
+  decidedByUserId  String
+  notes            String?
+  createdAt        DateTime      @default(now())
+
+  images ReturnReviewImage[]
+
+  @@index([orderId])
+  @@map("return_reviews")
+}
+
+/// Photo evidence attached to a Return station decision (condition of the returned item,
+/// defect close-ups, etc.) — for record purposes, same "uploaded or pasted link" pattern as
+/// ProductImage. Never deleted individually as part of any workflow; a hard delete endpoint
+/// exists only for correcting a mistaken upload.
+model ReturnReviewImage {
+  id             String       @id @default(cuid())
+  returnReviewId String
+  returnReview   ReturnReview @relation(fields: [returnReviewId], references: [id])
+  url            String
+  createdAt      DateTime     @default(now())
+
+  @@index([returnReviewId])
+  @@map("return_review_images")
+}
+
+model QcReview {
+  id               String    @id @default(cuid())
+  orderId          String
+  order            Order     @relation(fields: [orderId], references: [id])
+  stationVisitId   String
+  outcome          QcOutcome
+  reviewedByUserId String
+  notes            String?
+  createdAt        DateTime  @default(now())
+
+  @@index([orderId])
+  @@map("qc_reviews")
+}
+
+model ReworkRoute {
+  id                      String             @id @default(cuid())
+  orderId                 String
+  order                   Order              @relation(fields: [orderId], references: [id])
+  /// Null when this rework was routed by a regular station rejecting the order it just
+  /// received (POST /scan/reject) rather than by a formal QC decision — see
+  /// OrderEventType.STATION_REJECTED vs QC_DECISION.
+  qcReviewId              String?
+  targetStationId         String
+  targetStation           Station            @relation("ReworkRouteTarget", fields: [targetStationId], references: [id])
+  /// The station that actually rejected the order — the QC checkpoint for a formal QC
+  /// decision, or the regular station that called POST /scan/reject. Nullable only for rows
+  /// created before this field existed; always set going forward. Lets a station queue view
+  /// show "returned by Embroidery" / "rerouted by QC" without recomputing it from sortOrder.
+  fromStationId           String?
+  fromStation             Station?           @relation("ReworkRouteFrom", fields: [fromStationId], references: [id])
+  /// Structured category for why the rework was needed — Management-configurable, see
+  /// QcRejectionReason. Optional and additive to `reason` (free text), same pattern as
+  /// Order.discountAmount/discountReason.
+  rejectionReasonId       String?
+  rejectionReason         QcRejectionReason? @relation(fields: [rejectionReasonId], references: [id])
+  reason                  String?
+  /// Set once the target station actually receives the order — the StationVisit created for
+  /// that revisit (see StationVisit.reworkRouteId, its inverse, set by receiveAtStation). Lets
+  /// logOutgoingAtStation tell a formal QC-flagged revisit (qcReviewId set here) apart from a
+  /// plain peer-station rejection (qcReviewId null) once that station finishes: a QC-flagged
+  /// one routes straight back to QC on outgoing instead of continuing the normal station
+  /// sequence. Plain string, no FK relation, same convention as OrderEvent.actorUserId.
+  resultingStationVisitId String?
+  createdAt               DateTime           @default(now())
+
+  items ReworkRouteItem[]
+
+  @@index([orderId])
+  @@index([targetStationId])
+  @@index([fromStationId])
+  @@index([rejectionReasonId])
+  @@map("rework_routes")
+}
+
+/// Which OrderItem(s) within the order a given ReworkRoute flagged as defective —
+/// many-to-many since one rework decision may name several items at once. Optional:
+/// a rework doesn't have to name a specific item (e.g. a paperwork/packaging issue
+/// affecting the whole order), so a ReworkRoute may have zero rows here.
+model ReworkRouteItem {
+  id            String      @id @default(cuid())
+  reworkRouteId String
+  reworkRoute   ReworkRoute @relation(fields: [reworkRouteId], references: [id])
+  orderItemId   String
+  orderItem     OrderItem   @relation(fields: [orderItemId], references: [id])
+  createdAt     DateTime    @default(now())
+
+  @@unique([reworkRouteId, orderItemId])
+  @@index([orderItemId])
+  @@map("rework_route_items")
+}
+
+/// Management-configurable catalog of QC rejection/rework reasons — same "enum → editable
+/// table" pattern as Station/Role/ProductCategory. Feeds both the qc-decision request
+/// (ReworkRoute.rejectionReasonId) and the QC metrics report (GET /orders/reports/qc),
+/// so rework causes can be tracked and reported on by category over time.
+model QcRejectionReason {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  slug      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reworkRoutes ReworkRoute[]
+
+  @@map("qc_rejection_reasons")
+}
+
+model DeliveryOutcome {
+  id                   String              @id @default(cuid())
+  orderId              String
+  order                Order               @relation(fields: [orderId], references: [id])
+  outcome              DeliveryOutcomeType
+  customerConfirmed    Boolean             @default(false)
+  returnReason         ReturnReason?
+  /// Free-text detail behind returnReason for a RETURNED outcome (e.g. "Loose stitching on the
+  /// left bolster") — shown in the returns report.
+  returnNote           String?
+  responsibleStationId String?
+  responsibleStation   Station?            @relation(fields: [responsibleStationId], references: [id])
+  /// Third-party courier name (e.g. "J&T Express", "LBC", "Lalamove") when this DELIVERED
+  /// outcome was fulfilled by a courier drop-off rather than an in-person pickup/hand-off.
+  /// Null when no courier was involved (in-person pickup/hand-off). Can also be set on a
+  /// RETURNED outcome, for the courier that brought it back.
+  courierName          String?
+  /// The courier's own waybill/tracking number for this delivery, for customer-facing
+  /// tracking or dispute lookup. Only meaningful alongside courierName.
+  waybillNumber        String?
+  recordedByUserId     String
+  createdAt            DateTime            @default(now())
+
+  @@index([orderId])
+  @@index([responsibleStationId])
+  @@map("delivery_outcomes")
+}
+
+model OrderEvent {
+  id          String         @id @default(cuid())
+  orderId     String
+  order       Order          @relation(fields: [orderId], references: [id])
+  type        OrderEventType
+  stationId   String?
+  station     Station?       @relation(fields: [stationId], references: [id])
+  actorUserId String
+  message     String?
+  metadata    Json?
+  createdAt   DateTime       @default(now())
+
+  @@index([orderId, createdAt])
+  @@index([stationId])
+  @@map("order_events")
+}
+
+/// A structured concern/clarification raised on an order while it is physically checked
+/// in at a station — purely informational/advisory, never a workflow gate. stationId/
+/// stationVisitId are captured server-side from the order's state at raise time, never
+/// client-supplied. Every raise/resolve also writes a normal OrderEvent so it shows up in
+/// GET /orders/:id/timeline — this model is the structured/resolvable detail behind that.
+model OrderConcern {
+  id               String           @id @default(cuid())
+  orderId          String
+  order            Order            @relation(fields: [orderId], references: [id])
+  stationId        String
+  station          Station          @relation(fields: [stationId], references: [id])
+  stationVisitId   String?
+  type             OrderConcernType
+  message          String
+  raisedByUserId   String
+  isResolved       Boolean          @default(false)
+  resolvedByUserId String?
+  resolutionNote   String?
+  resolvedAt       DateTime?
+  createdAt        DateTime         @default(now())
+
+  @@index([orderId, createdAt])
+  @@index([stationId])
+  @@map("order_concerns")
+}

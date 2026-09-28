@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+npm-debug.log*
+.DS_Store
+backups/
+logs/
+uploads/
+
+/src/generated/prisma
+
+# Local tool/editor config and caches — machine-specific, not project source
+.claude/
+.agents/
+.windsurf/
+skills-lock.json
+
+# Contains real account credentials, not for source control
+sample users.txt

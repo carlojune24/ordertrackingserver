@@ -1,0 +1,5 @@
+-- AlterEnum
+ALTER TYPE "OrderEventType" ADD VALUE 'DOWN_PAYMENT_UPDATED';
+
+-- AlterTable
+ALTER TABLE "orders" ADD COLUMN     "downPayment" DOUBLE PRECISION NOT NULL DEFAULT 0;
