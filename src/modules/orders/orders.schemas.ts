@@ -79,6 +79,7 @@ export const overrideStationBodySchema = z.object({
 const productSummarySchema = z.object({
   id: z.string(),
   name: z.string(),
+  description: z.string().nullable(),
   categoryId: z.string(),
   categoryName: z.string(),
 });

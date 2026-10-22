@@ -42,6 +42,7 @@ function toOrderItemDto(item: OrderWithRelations["items"][number], orderNumber: 
     product: {
       id: product.id,
       name: product.name,
+      description: product.description,
       categoryId: product.category.id,
       categoryName: product.category.name,
     },
